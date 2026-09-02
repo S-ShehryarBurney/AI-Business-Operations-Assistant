@@ -2,8 +2,62 @@ from dotenv import load_dotenv
 import os
 from openai import OpenAI
 import json
+from fastapi import FastAPI, Depends
+from app.database import SessionLocal
+from app.models import Customer, Order, Product
 
 load_dotenv()
+
+app = FastAPI()
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+@app.get("/customers/{customer_id}")
+def read_customer(customer_id: int, db = Depends(get_db)):
+    customer = db.query(Customer).filter(Customer.customer_id == customer_id).first()
+
+    if not customer:
+        return {"error": "Customer does not exist."}
+
+    return{
+        "customer_id": customer.customer_id,
+        "name": customer.name,
+        "email": customer.email,
+        "status": customer.status
+    }
+
+@app.get("/orders/{order_id}")
+def read_order(order_id: int, db = Depends(get_db)):
+    order = db.query(Order).filter(Order.order_id == order_id).first()
+
+    if not order:
+        return {"error": "Order does not exist."}
+
+    return{
+        "order_id": order.order_id,
+        "customer_id": order.customer_id,
+        "product_id": order.product_id,
+        "status": order.status
+    }
+
+@app.get("/products/{product_id}")
+def read_product(product_id: int, db = Depends(get_db)):
+    product = db.query(Product).filter(Product.product_id == product_id).first()
+
+    if not product:
+        return {"error": "Product does not exist."}
+
+    return{
+        "product_id": product.product_id,
+        "name": product.name,
+        "price": product.price,
+        "status": product.status
+    }
 
 openrouter_api_key = os.environ.get("OPENROUTER_API_KEY")
 
@@ -17,44 +71,60 @@ client = OpenAI(
     base_url="https://openrouter.ai/api/v1"
 )
 
-customers = [
-    {"customer_id": 101, "name": "Nida", "email": "nida@example.com", "status": "active"},
-    {"customer_id": 102, "name": "Hashmat", "email": "hashmat@example.com", "status": "active"},
-    {"customer_id": 103, "name": "Shehryar", "email": "shehryar@example.com", "status": "inactive"}
-]
-
-orders = [
-    {"order_id": 112, "customer_id": 101, "product_id": 10, "status": "shipped"},
-    {"order_id": 113, "customer_id": 102, "product_id": 12, "status": "processing"},
-    {"order_id": 114, "customer_id": 103, "product_id": 14, "status": "cancelled"}
-]
-
-products = [
-    {"product_id": 10, "name": "Zero Carbon Earbuds", "price": 2500, "status": "out of stock"},
-    {"product_id": 12, "name": "Zero Platinum Smartwatch", "price": 14699, "status": "in stock"},
-    {"product_id": 14, "name": "Gionee Handsfree", "price": 350, "status": "discontinued"}
-]
-
 def get_customer(customer_id):
-    for customer in customers:
-        if customer["customer_id"] == customer_id:
-            return customer
+    db = SessionLocal()
 
-    raise ValueError("Customer does not exist.")
+    try:
+        customer = db.query(Customer).filter(Customer.customer_id == customer_id).first()
+    
+
+        if not customer:
+            raise ValueError("Customer does not exist.")
+
+        return{
+            "customer_id": customer.customer_id,
+            "name": customer.name,
+            "email": customer.email,
+            "status": customer.status
+        }
+    finally:
+        db.close()
 
 def get_order(order_id):
-    for order in orders:
-        if order["order_id"] == order_id:
-            return order
+    db = SessionLocal()
 
-    raise ValueError("Order does not exist.")
+    try:
+        order = db.query(Order).filter(Order.order_id == order_id).first()
+        
+        if not order:
+            raise ValueError("Order does not exist.")
+
+        return{
+            "order_id": order.order_id,
+            "customer_id": order.customer_id,
+            "product_id": order.product_id,
+            "status": order.status
+        }
+    finally:
+        db.close()
 
 def get_product(product_id):
-    for product in products:
-        if product["product_id"] == product_id:
-            return product
+    db = SessionLocal()
 
-    raise ValueError("Product does not exist.")
+    try:
+        product = db.query(Product).filter(Product.product_id == product_id).first()
+
+        if not product:
+            raise ValueError("Product does not exist.")
+
+        return{
+            "product_id": product.product_id,
+            "name": product.name,
+            "price": product.price,
+            "status": product.status
+        }
+    finally:
+        db.close()
 
 get_customer_tool = {
     "type": "function",
@@ -107,7 +177,7 @@ get_product_tool = {
 if __name__ == "__main__":
     response = client.responses.create(
         model = "nvidia/nemotron-3.5-lightning:free",
-        input = "What is the status of customer 102?",
+        input = "What is the price and status of product 10?",
         tools = [get_customer_tool, get_order_tool, get_product_tool]
     )
 
@@ -143,5 +213,3 @@ if __name__ == "__main__":
             )
 
             print(final_response.output_text)
-
-#print(response.output_text)
