@@ -37,28 +37,3 @@ def search_knowledge(query):
     db.close()
 
     return content
-
-query = "How long does standard shipping take?"
-
-result = search_knowledge(query)
-
-print("Best Chunk:")
-print(result)
-
-prompt = f"""
-Answer the user's question using the company policy below.
-
-Company Policy:
-{result}
-
-User Question:
-{query}
-"""
-
-response = client.responses.create(
-    model = "nvidia/nemotron-3.5-lightning:free",
-    input = prompt
-)
-
-print("AI Answer:")
-print(response.output_text)
