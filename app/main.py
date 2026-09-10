@@ -5,10 +5,15 @@ import json
 from fastapi import FastAPI, Depends
 from app.database import SessionLocal
 from app.models import Customer, Order, Product
+from app.rag import search_knowledge
+from pydantic import BaseModel
 
 load_dotenv()
 
 app = FastAPI()
+
+class AssistantRequest(BaseModel):
+    message: str
 
 def get_db():
     db = SessionLocal()
@@ -58,6 +63,12 @@ def read_product(product_id: int, db = Depends(get_db)):
         "price": product.price,
         "status": product.status
     }
+
+@app.post("/assistant")
+def assistant(request: AssistantRequest):
+    answer = run_agent(request.message)
+
+    return {"answer": answer}
 
 openrouter_api_key = os.environ.get("OPENROUTER_API_KEY")
 
@@ -174,42 +185,98 @@ get_product_tool = {
     }
 }
 
-if __name__ == "__main__":
+get_search_knowledge_tool = {
+    "type": "function",
+    "name": "search_knowledge",
+    "description": "Use this tool when a user asks about company policies, procedures, rules, or other information contained in the company's internal knowledge.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "The user's question or request to search for relevant information in the company's internal knowledge."
+            }
+        },
+    "required": ["query"]
+    }
+}   
+
+agent_instructions = """
+You are an AI business operations assistant.
+
+Your job is to answer the user's request using the available business data and company knowledge tools.
+
+Before answering:
+- Understand exactly what information the user is asking for.
+- Identify all information needed to answer the request accurately.
+- Use the appropriate tools to retrieve that information.
+- Follow dependencies between tool results when necessary. For example, an order may identify a product ID that must then be used to retrieve the product.
+- Use company knowledge when the request involves company policies, procedures, rules, or internal information.
+- Cross-reference business data and company knowledge when the user's question requires both.
+- Do not guess or invent information.
+- Use tool results as evidence for your answer.
+- Continue using tools until you have enough information to answer the user's complete request.
+- Once you have sufficient information, stop using tools and provide a concise, clear answer.
+"""
+
+def run_agent(user_message):
+    
+    conversation = [
+        {
+            "role": "user",
+            "content": user_message
+        }
+    ]
+    max_rounds = 5
+
     response = client.responses.create(
         model = "nvidia/nemotron-3.5-lightning:free",
-        input = "What is the price and status of product 10?",
-        tools = [get_customer_tool, get_order_tool, get_product_tool]
+        instructions = agent_instructions,
+        input = conversation,
+        tools = [get_customer_tool, get_order_tool, get_product_tool, get_search_knowledge_tool]
     )
 
-    for item in response.output:
-        if item.type == "function_call":
-            print(item.name)
-            print(item.arguments)
-            print(item.call_id)
-            arguments = json.loads(item.arguments)
-            print(arguments)
+    for round_number in range(max_rounds):
+        tool_outputs = []
+        tool_called = False
 
-            if item.name == "get_customer":
-                tool_output = get_customer(arguments["customer_id"])
+        for item in response.output:
+            if item.type == "function_call":
+                tool_called = True
+                arguments = json.loads(item.arguments)
 
-            elif item.name == "get_order":
-                tool_output = get_order(arguments["order_id"])
+                if item.name == "get_customer":
+                    tool_output = get_customer(arguments["customer_id"])
 
-            else:
-                tool_output = get_product(arguments["product_id"])
+                elif item.name == "get_order":
+                    tool_output = get_order(arguments["order_id"])
 
-            tool_output = json.dumps(tool_output)
+                elif item.name == "get_product":
+                    tool_output = get_product(arguments["product_id"])
 
-            final_response = client.responses.create(
-                model = "nvidia/nemotron-3.5-lightning:free",
-                input = [
-                *response.output,
-                {
+                elif item.name == "search_knowledge":
+                    tool_output = search_knowledge(arguments["query"])
+
+                else:
+                    raise ValueError(f"Unknown tool: {item.name}")
+
+                tool_outputs.append({
                     "type": "function_call_output",
                     "call_id": item.call_id,
-                    "output": tool_output
-                }
-                ]
+                    "output": json.dumps(tool_output)
+                })
+
+        conversation.extend(response.output)
+        conversation.extend(tool_outputs)
+
+        if not tool_called:
+            return response.output_text
+
+        response = client.responses.create(
+                model = "nvidia/nemotron-3.5-lightning:free",
+                instructions = agent_instructions,
+                input = conversation,
+                tools = [get_customer_tool, get_order_tool, get_product_tool, get_search_knowledge_tool]
             )
 
-            print(final_response.output_text)
+    raise RuntimeError("Agent reached the maximum number of tool-calling rounds.")
