@@ -5,8 +5,9 @@ import json
 from fastapi import FastAPI, Depends
 from app.database import SessionLocal
 from app.models import Customer, Order, Product
-from app.rag import search_knowledge
+from app.rag import search_knowledge, list_company_policies
 from pydantic import BaseModel
+from app.errors import AgentLoopError, ToolError
 
 load_dotenv()
 
@@ -66,9 +67,12 @@ def read_product(product_id: int, db = Depends(get_db)):
 
 @app.post("/assistant")
 def assistant(request: AssistantRequest):
-    answer = run_agent(request.message)
+    try:
+        answer = run_agent(request.message)
+        return {"answer": answer}
 
-    return {"answer": answer}
+    except AgentLoopError as error:
+        return {"answer": str(error)}
 
 openrouter_api_key = os.environ.get("OPENROUTER_API_KEY")
 
@@ -83,14 +87,20 @@ client = OpenAI(
 )
 
 def get_customer(customer_id):
+
+    if isinstance(customer_id, bool) or not isinstance(customer_id, int):
+        raise ToolError("Invalid customer ID. ID must be an integer.")
+
+    if customer_id <= 0:
+        raise ToolError("Invalid customer ID. ID must be a positive integer.")
+
     db = SessionLocal()
 
     try:
         customer = db.query(Customer).filter(Customer.customer_id == customer_id).first()
-    
 
         if not customer:
-            raise ValueError("Customer does not exist.")
+            raise ToolError("Customer does not exist.")
 
         return{
             "customer_id": customer.customer_id,
@@ -102,13 +112,20 @@ def get_customer(customer_id):
         db.close()
 
 def get_order(order_id):
+
+    if isinstance(order_id, bool) or not isinstance(order_id, int):
+        raise ToolError("Invalid order ID. ID must be an integer.")
+
+    if order_id <= 0:
+        raise ToolError("Invalid order ID. ID must be a positive integer.")
+
     db = SessionLocal()
 
     try:
         order = db.query(Order).filter(Order.order_id == order_id).first()
         
         if not order:
-            raise ValueError("Order does not exist.")
+            raise ToolError("Order does not exist.")
 
         return{
             "order_id": order.order_id,
@@ -120,13 +137,19 @@ def get_order(order_id):
         db.close()
 
 def get_product(product_id):
+    if isinstance(product_id, bool) or not isinstance(product_id, int):
+        raise ToolError("Invalid product ID. ID must be an integer.")
+
+    if product_id <= 0:
+        raise ToolError("Invalid product ID. ID must be a positive integer.")
+
     db = SessionLocal()
 
     try:
         product = db.query(Product).filter(Product.product_id == product_id).first()
 
         if not product:
-            raise ValueError("Product does not exist.")
+            raise ToolError("Product does not exist.")
 
         return{
             "product_id": product.product_id,
@@ -201,6 +224,17 @@ get_search_knowledge_tool = {
     }
 }   
 
+list_company_policies_tool = {
+    "type": "function",
+    "name": "list_company_policies",
+    "description": "Use this tool when a user asks for a list of all company policies available in the company's internal knowledge.",
+    "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+    }
+}
+
 agent_instructions = """
 You are an AI business operations assistant.
 
@@ -217,6 +251,7 @@ Before answering:
 - Use tool results as evidence for your answer.
 - Continue using tools until you have enough information to answer the user's complete request.
 - Once you have sufficient information, stop using tools and provide a concise, clear answer.
+- Use list_company_policies when the user asks to list, name, or identify all policies in the internal knowledge base. Use search_knowledge when the user asks about the content or details of a policy.
 """
 
 def run_agent(user_message):
@@ -233,7 +268,11 @@ def run_agent(user_message):
         model = "nvidia/nemotron-3.5-lightning:free",
         instructions = agent_instructions,
         input = conversation,
-        tools = [get_customer_tool, get_order_tool, get_product_tool, get_search_knowledge_tool]
+        tools = [get_customer_tool, 
+                 get_order_tool, 
+                 get_product_tool, 
+                 get_search_knowledge_tool, 
+                 list_company_policies_tool]
     )
 
     for round_number in range(max_rounds):
@@ -241,24 +280,51 @@ def run_agent(user_message):
         tool_called = False
 
         for item in response.output:
+
             if item.type == "function_call":
                 tool_called = True
-                arguments = json.loads(item.arguments)
 
-                if item.name == "get_customer":
-                    tool_output = get_customer(arguments["customer_id"])
+                try:
+                    try:
+                        arguments = json.loads(item.arguments)
+                    except (json.JSONDecodeError, TypeError):
+                        raise ToolError("Tool arguments must be valid JSON.")    
 
-                elif item.name == "get_order":
-                    tool_output = get_order(arguments["order_id"])
+                    if not isinstance(arguments, dict):
+                        raise ToolError("Tool arguments must be a JSON object.")
+                
+                    if item.name == "get_customer":
+                        if "customer_id" not in arguments:
+                            raise ToolError("Missing required argument: customer_id.")
 
-                elif item.name == "get_product":
-                    tool_output = get_product(arguments["product_id"])
+                        tool_output = get_customer(arguments["customer_id"])
 
-                elif item.name == "search_knowledge":
-                    tool_output = search_knowledge(arguments["query"])
+                    elif item.name == "get_order":
+                        if "order_id" not in arguments:
+                            raise ToolError("Missing required argument: order_id.")
 
-                else:
-                    raise ValueError(f"Unknown tool: {item.name}")
+                        tool_output = get_order(arguments["order_id"])
+
+                    elif item.name == "get_product":
+                        if "product_id" not in arguments:
+                            raise ToolError("Missing required argument: product_id.")
+                        
+                        tool_output = get_product(arguments["product_id"])
+
+                    elif item.name == "search_knowledge":
+                        if "query" not in arguments:
+                            raise ToolError("Missing required argument: query.")
+
+                        tool_output = search_knowledge(arguments["query"])
+
+                    elif item.name == "list_company_policies":
+                        tool_output = list_company_policies()
+
+                    else:
+                        raise ToolError(f"Unknown tool: {item.name}")
+
+                except ToolError as error:
+                    tool_output = {"error": str(error)}
 
                 tool_outputs.append({
                     "type": "function_call_output",
@@ -276,7 +342,11 @@ def run_agent(user_message):
                 model = "nvidia/nemotron-3.5-lightning:free",
                 instructions = agent_instructions,
                 input = conversation,
-                tools = [get_customer_tool, get_order_tool, get_product_tool, get_search_knowledge_tool]
+                tools = [get_customer_tool, 
+                         get_order_tool, 
+                         get_product_tool, 
+                         get_search_knowledge_tool, 
+                         list_company_policies_tool]
             )
 
-    raise RuntimeError("Agent reached the maximum number of tool-calling rounds.")
+    raise AgentLoopError("The agent could not complete the task within the allowed reasoning limit.")

@@ -30,5 +30,6 @@ class CompanyKnowledge(Base):
     __tablename__ = "company_knowledge"
 
     id = Column(Integer, primary_key = True)
+    policy_name = Column(String, nullable = False)
     content = Column(Text, nullable = False)
     embedding = Column(Vector(2048), nullable = False)

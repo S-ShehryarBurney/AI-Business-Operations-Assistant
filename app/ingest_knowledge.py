@@ -54,7 +54,9 @@ db = SessionLocal()
 db.query(CompanyKnowledge).delete()
 
 for chunk, embedding in zip(chunks, embeddings):
+    policy_name = chunk.splitlines()[0].strip()  # Extract the first line as the policy name
     knowledge = CompanyKnowledge(
+        policy_name = policy_name,
         content = chunk,
         embedding = embedding
     )
