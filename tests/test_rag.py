@@ -5,10 +5,48 @@ from app.rag import list_company_policies, search_knowledge
 from app.errors import ToolError
 
 
-def test_search_knowledge():
-    result = search_knowledge("Can I return a product after a month?")
+@pytest.fixture(autouse=True)
+def mock_openrouter_client(monkeypatch):
+    monkeypatch.setattr("app.rag.client", object())
 
-    assert "14 days of delivery" in result
+
+def test_search_knowledge(monkeypatch):
+    expected_query = "Can I return a product after a month?"
+    expected_embedding = [0.1, 0.2, 0.3]
+    captured = {}
+
+    class FakeQuery:
+        def order_by(self, distance_expression):
+            captured["distance_expression"] = distance_expression
+            return self
+
+        def first(self):
+            return SimpleNamespace(content="Customers can return unused products within 14 days of delivery.")
+
+    class FakeSession:
+        def query(self, *args, **kwargs):
+            captured["query_target"] = args[0]
+            return FakeQuery()
+
+        def close(self):
+            return None
+
+    def fake_create(**kwargs):
+        captured["embedding_model"] = kwargs["model"]
+        captured["embedding_input"] = kwargs["input"]
+        return SimpleNamespace(data=[SimpleNamespace(embedding=expected_embedding)])
+
+    monkeypatch.setattr("app.rag.require_database_config", lambda: None)
+    monkeypatch.setattr("app.rag.get_session", lambda: FakeSession())
+    monkeypatch.setattr("app.rag.client", SimpleNamespace(embeddings=SimpleNamespace(create=fake_create)))
+
+    result = search_knowledge(expected_query)
+
+    assert result == "Customers can return unused products within 14 days of delivery."
+    assert captured["embedding_input"] == expected_query
+    assert captured["embedding_model"] == "nvidia/nemotron-3-embed-1b:free"
+    assert captured["query_target"] is not None
+    assert captured["distance_expression"] is not None
 
 
 @pytest.mark.parametrize("query", [
@@ -17,7 +55,9 @@ def test_search_knowledge():
     True,
     []
 ])
-def test_search_knowledge_invalid_query_type(query):
+def test_search_knowledge_invalid_query_type(monkeypatch, query):
+    monkeypatch.setattr("app.rag.client", object())
+
     with pytest.raises(ToolError, match = "Query must be a string."):
         search_knowledge(query)
 
@@ -27,7 +67,9 @@ def test_search_knowledge_invalid_query_type(query):
     "   ",
     "\n\t"
 ])
-def test_search_knowledge_empty_query(query):
+def test_search_knowledge_empty_query(monkeypatch, query):
+    monkeypatch.setattr("app.rag.client", object())
+
     with pytest.raises(ToolError, match = "Query cannot be empty."):
         search_knowledge(query)
 
