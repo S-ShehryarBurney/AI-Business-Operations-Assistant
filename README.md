@@ -1,93 +1,72 @@
-# AI Business Operations Assistant
+﻿# AI Business Operations Assistant
 
-This repository contains a FastAPI-based business operations assistant that answers operational questions using:
+A grounded AI business operations assistant for customer, order, product, and policy questions. The project combines a Streamlit frontend, a FastAPI backend, a tool-calling OpenRouter-backed agent, and a PostgreSQL + pgvector data layer to provide operational answers grounded in retrieved evidence.
 
-- PostgreSQL + SQLAlchemy for structured business records
-- pgvector for semantic company knowledge retrieval
-- OpenRouter-hosted LLM APIs for agent orchestration
-- a bounded multi-step tool-calling loop
+The system is designed to answer questions such as:
 
-## Purpose
+- customer status and profile details
+- order status and related product context
+- product availability and business record details
+- company policy questions using the internal knowledge base
 
-The project is designed to answer questions about:
+## What is in this repository
 
-- customers
-- orders
-- products
-- internal company policies and operational knowledge
+This repository contains the implementation and local validation artifacts for the project:
 
-The assistant uses business data tools and a retrieval-augmented knowledge layer to ground responses in available evidence instead of inventing facts.
+- `app/` — FastAPI app, agent orchestration, database models, RAG helpers, and setup scripts
+- `frontend/streamlit_app.py` — dark-themed Streamlit operations dashboard
+- `knowledge/company_policies.txt` — internal company policy content used for retrieval
+- `tests/` — automated validation for customer, order, product, policy, and agent behavior
+- `requirements.txt` — Python dependencies for the project
 
-## Architecture
+## Current architecture
 
-### Core application modules
-
-- `app/main.py`: FastAPI API entry point and orchestration logic for the agent
-- `app/database.py`: SQLAlchemy engine/session configuration and database startup checks
-- `app/models.py`: SQLAlchemy table models for customers, orders, products, and company knowledge
-- `app/rag.py`: semantic knowledge search and policy listing
-- `app/errors.py`: project-specific exceptions for controlled tool and agent conditions
-- `app/ingest_knowledge.py`: script to load and embed knowledge entries for the internal knowledge base
-- `app/seed_data.py`: script to seed the database with sample business records
-
-### Data model
-
-The current architecture expects PostgreSQL with pgvector enabled.
-
-Relevant tables include:
-
-- `customers`: customer records
-- `orders`: order records
-- `products`: product records
-- `company_knowledge`: policy content + vector embedding
-
-`CompanyKnowledge.embedding` is modeled as `Vector(2048)` and therefore depends on the PostgreSQL + pgvector stack.
-
-## Environment
-
-Set the following environment variables before using the app:
-
-- `DATABASE_URL`: PostgreSQL connection string for business records and knowledge storage
-- `OPENROUTER_API_KEY`: API key used by the LLM and embedding endpoints
-
-Example:
-
-```bash
-export DATABASE_URL="postgresql+psycopg2://user:password@host:5432/ai_business_operations"
-export OPENROUTER_API_KEY="your-key"
+```text
+Browser
+  ↓
+Streamlit frontend
+  ↓ HTTP POST /assistant
+FastAPI backend
+  ↓
+run_agent()
+  ↓
+OpenRouter-hosted model
+  ↓
+5 business tools
+├── get_customer
+├── get_order
+├── get_product
+├── search_knowledge
+└── list_company_policies
+  ↓
+PostgreSQL + SQLAlchemy
+  and/or
+pgvector knowledge retrieval
+  ↓
+agent reasoning loop
+  ↓
+grounded final answer
+  ↓
+Streamlit UI
 ```
 
-## Database setup
+The local application flow above reflects the repository as it currently exists. The agent is bounded to a maximum of 5 reasoning/tool-calling rounds before it stops with an `AgentLoopError` instead of continuing indefinitely.
 
-The project expects a PostgreSQL database with the pgvector extension available.
+The LLM handles natural-language interpretation, reasoning, and tool selection. Deterministic Python and database logic remain authoritative for the business facts returned to the user.
 
-Initialize the schema with SQLAlchemy metadata creation or via the project bootstrap flow used in your local environment.
+## FastAPI backend
 
-Do not use a SQLite fallback for the configured architecture.
+The backend is implemented in `app/main.py` and exposes the assistant API.
 
-## Knowledge ingestion
+Responsibilities include:
 
-To load the company policy knowledge base:
+- validating incoming requests
+- rejecting blank or whitespace-only messages with HTTP 422
+- routing the user message through the tool-calling agent
+- invoking database-backed business tools for customers, orders, products, and policy lookups
+- returning a consistent `{ "answer": "..." }` JSON contract
 
-```bash
-python -m app.ingest_knowledge
-```
-
-This script reads the policy text from `knowledge/company_policies.txt`, chunks the content, requests embeddings from the configured OpenRouter embedding model, and writes the resulting vectorized documents into the PostgreSQL knowledge table.
-
-## API usage
-
-Run the API with:
-
-```bash
-uvicorn app.main:app --reload
-```
-
-The assistant endpoint is:
-
-- `POST /assistant`
-
-Request body:
+The request model accepts:
 
 ```json
 {
@@ -95,7 +74,7 @@ Request body:
 }
 ```
 
-Successful response contract:
+The successful response format is:
 
 ```json
 {
@@ -103,49 +82,217 @@ Successful response contract:
 }
 ```
 
-The system intentionally avoids exposing raw Python exceptions or database internals through the API.
+## Streamlit frontend
 
-## Agent behavior
+The frontend is implemented in `frontend/streamlit_app.py`.
 
-The agent is bounded to a maximum number of reasoning/tool-calling rounds to avoid runaway loops. If that limit is exhausted, it raises an `AgentLoopError` and the API returns a controlled answer string instead of crashing.
+It includes:
 
-Tool execution follows a controlled pattern:
+- a dark professional operations dashboard theme
+- a chat-style conversation UI
+- suggested prompts for common operational requests
+- session-state conversation history
+- a New Conversation control
+- loading/progress feedback while the backend is processing
+- graceful handling if the backend is unavailable or returns an invalid response
+- non-200 HTTP handling from the FastAPI service
 
-- expected business logic conditions use `ToolError`
-- infrastructure or execution failures are translated to `ToolExecutionError`
-- tool outputs include sanitized error information instead of leaking internal SQL or stack traces
+This Streamlit app communicates with the FastAPI backend over HTTP only. It does not connect directly to PostgreSQL or OpenRouter.
 
-## Grounding / hallucination guardrails
+## Business data model
 
-The assistant is instructed to:
+The SQLAlchemy models in `app/models.py` define the core relational records used by the assistant:
 
-- rely on actual tool outputs as evidence
-- avoid guessing when a record is missing
-- say when information is unavailable instead of inventing it
-- use `list_company_policies()` for policy enumeration requests
-- use `search_knowledge()` for policy-content questions
-- treat tool errors as evidence that the requested fact was not retrieved successfully
+- `Customer`
+- `Order`
+- `Product`
+- `CompanyKnowledge`
+
+The project uses PostgreSQL + SQLAlchemy for the structured business tables and stores document knowledge with pgvector. The `CompanyKnowledge.embedding` field is defined as `Vector(2048)`, matching the current implementation.
+
+There is no formal migration framework in the repository at the current project level; the schema is created through the project’s local bootstrap scripts and in-project setup flow.
+
+## Agent tools
+
+The agent exposes 5 purpose-built tools:
+
+| Tool | Purpose | Data source | Input |
+| --- | --- | --- | --- |
+| `get_customer` | Retrieve a specific customer record | PostgreSQL `customers` table | `customer_id` |
+| `get_order` | Retrieve a specific order record | PostgreSQL `orders` table | `order_id` |
+| `get_product` | Retrieve a specific product record | PostgreSQL `products` table | `product_id` |
+| `search_knowledge` | Search internal policy knowledge semantically | pgvector-backed knowledge table | `query` |
+| `list_company_policies` | List the available company policy names | `company_knowledge` table | none |
+
+Each tool is validated before execution, including malformed JSON handling, missing required arguments, and controlled error propagation.
+
+## RAG and policy retrieval
+
+The repository includes a knowledge base in `knowledge/company_policies.txt`.
+
+The ingestion flow in `app/ingest_knowledge.py`:
+
+- reads the knowledge file
+- chunks the text into policy sections
+- requests OpenRouter embeddings for each chunk
+- stores the results in PostgreSQL using pgvector
+
+The retrieval layer in `app/rag.py` implements:
+
+- `search_knowledge(query)` — semantic retrieval using an OpenRouter embedding and cosine-distance ordering
+- `list_company_policies()` — deterministic enumeration of the available policy names
+
+These are intentionally separate behaviors:
+
+- Semantic search answers questions about the content of a policy, such as "What is the return policy?"
+- Deterministic enumeration answers questions about the set of policy names, such as "What policies are available?"
+
+The project does not claim a mathematical hallucination-proof guarantee. Grounding is enforced through retrieved tool evidence and explicit agent instructions rather than by an arbitrary hardcoded relevance threshold in the current implementation.
+
+## n8n integration note
+
+An external n8n workflow was used during development and manually tested end-to-end as an automation layer around the FastAPI assistant.
+
+The workflow conceptually operated as:
+
+```text
+n8n Webhook
+  ↓
+HTTP Request
+  ↓
+FastAPI /assistant
+  ↓
+AI agent / tool orchestration
+  ↓
+final response
+  ↓
+n8n
+```
+
+That n8n workflow was created and tested in the n8n browser interface, but the workflow configuration is not stored as a tracked file in this repository. The repository contains the application code; the n8n automation remains an external integration layer that was used during development.
+
+## Safety and reliability work
+
+The project includes explicit safety and reliability patterns in the agent and tool layers.
+
+This corresponds to the Phase 6 safety work:
+
+- 6.1 Controlled Tool Errors
+- 6.2 Input / Argument Validation
+- 6.3 Tool Failure Handling
+- 6.4 Agent Loop Safety
+- 6.5 Grounding / Hallucination Guardrails
+- 6.6 Consistent API Response Contract
+- 6.7 Reliability Test Suite
+
+### Error classes
+
+The project defines these classes in `app/errors.py`:
+
+- `ToolError` — validation issues such as invalid arguments or missing records
+- `ToolExecutionError` — infrastructure or execution-level errors such as failed database access or missing provider configuration
+- `AgentLoopError` — the agent exceeded the allowed reasoning/tool loop limit
+
+### Guardrails and reliability rules
+
+The implementation includes:
+
+- tool argument validation
+- malformed JSON protection
+- required-argument enforcement
+- preserved `call_id` values for `function_call_output`
+- controlled tool errors
+- tool execution error handling
+- bounded agent loop exhaustion handling
+- grounding and evidence-based response behavior
+- consistent API output contract
+
+The agent loop is capped at 5 rounds to avoid runaway reasoning while still supporting multi-step business questions.
+
+## Environment and local setup
+
+The application expects the following environment variables to be configured locally:
+
+- `DATABASE_URL` — PostgreSQL connection string for business records and knowledge storage
+- `OPENROUTER_API_KEY` — API key used for the configured OpenRouter model and embedding endpoints
+- `ASSISTANT_API_URL` — optional frontend override; defaults to `http://127.0.0.1:8000/assistant`
+
+Example:
+
+```powershell
+$env:DATABASE_URL="postgresql://user:password@localhost:5432/ai_business_operations"
+$env:OPENROUTER_API_KEY="your-api-key"
+```
+
+### Run the backend
+
+```bash
+uvicorn app.main:app --reload
+```
+
+### Run the frontend
+
+```bash
+streamlit run frontend/streamlit_app.py
+```
+
+## Project initialization helpers
+
+The repository includes helper scripts for setup and local bootstrapping:
+
+- `app.init_db` — create the SQLAlchemy tables
+- `app.seed_data` — seed sample customer, product, and order records
+- `app.ingest_knowledge` — load `knowledge/company_policies.txt` and store policy embeddings in pgvector
+
+The database contents are sample operational data and policy knowledge used for local development and testing, not a production-scale enterprise dataset.
 
 ## Testing
 
-Run the full suite with:
+The repository contains a test suite organized in these files:
+
+- `tests/test_customer.py`
+- `tests/test_order.py`
+- `tests/test_product.py`
+- `tests/test_rag.py`
+- `tests/test_agent.py`
+
+The tests cover:
+
+- customer record validation and invalid ID handling
+- order record validation and invalid ID handling
+- product record validation and invalid ID handling
+- RAG query validation and knowledge retrieval behavior
+- tool argument validation, error conversion, and loop-safety checks
+- FastAPI response contract behavior
+
+### Final verified automated result
+
+The test suite was verified with the project virtual environment using:
 
 ```bash
-pytest
+.\.venv\Scripts\python.exe -m pytest -q
 ```
 
-The repository currently includes tests covering:
+Result:
 
-- customer lookup validation and error handling
-- order lookup validation and error handling
-- product lookup validation and error handling
-- RAG knowledge retrieval and query validation
-- agent tool call and loop safety behavior
-- API response contract behavior
+- 44 tests collected
+- 44 tests passed
+- 0 tests failed
 
-## Current limitations
+The RAG tests are mocked to avoid live OpenRouter requests while still validating the actual local vector search behavior and content retrieval path. The repository therefore has a stable automated test suite that does not depend on a live external embedding request.
 
-- The repository is a portfolio/application example rather than a full enterprise deployment.
-- The database and knowledge sources are expected to be configured externally via environment variables.
-- The system does not include an n8n workflow implementation in this repository; if such an integration exists conceptually, it is external to the codebase represented here.
-- The project intentionally avoids hiding configuration errors behind silent fallbacks; missing PostgreSQL/pgvector configuration is treated as a startup/runtime requirement rather than being replaced with another backend.
+## Manual validation performed during development
+
+The project was manually validated in a running local environment during development, including:
+
+- FastAPI backend requests and responses
+- the Streamlit frontend submitting prompts and rendering answers
+- customer, order, and product lookup flows through the agent tools
+- knowledge search and policy enumeration behavior against the local knowledge base
+- n8n automation developed and manually tested in the browser as an external integration layer around the FastAPI assistant
+
+The n8n workflow itself is not stored as a tracked repository file, but the end-to-end live validation was part of the project’s development process.
+
+## Summary
+
+This project is a functional prototype of a grounded business assistant that connects a human-friendly Streamlit interface to a FastAPI backend, a tool-calling AI agent, a PostgreSQL data layer, and a pgvector knowledge base. It demonstrates how a business assistant can answer operational questions using structured records and internal policy knowledge while keeping the final answer tied to retrieved evidence and explicit safety controls.
