@@ -2,19 +2,26 @@ from pathlib import Path
 from openai import OpenAI
 import os
 from dotenv import load_dotenv
-from app.database import SessionLocal
+from app.database import SessionLocal, require_database_config
 from app.models import CompanyKnowledge
 
 load_dotenv()
 
-client = OpenAI(
-    api_key = os.environ.get("OPENROUTER_API_KEY"),
-    base_url = "https://openrouter.ai/api/v1"
-)
+
+def get_client():
+    api_key = os.environ.get("OPENROUTER_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENROUTER_API_KEY is not configured for knowledge ingestion.")
+    return OpenAI(
+        api_key=api_key,
+        base_url="https://openrouter.ai/api/v1"
+    )
+
 
 def load_knowledge():
     knowledge_file = Path("knowledge/company_policies.txt")
     return knowledge_file.read_text(encoding="utf-8")
+
 
 def chunk_knowledge(text):
     sections = text.split("\n\nCOMPANY")
@@ -29,7 +36,9 @@ def chunk_knowledge(text):
 
     return chunks
 
-def create_embeddings(chunks):
+
+def create_embeddings(chunks, client=None):
+    client = client or get_client()
     embeddings = []
 
     for chunk in chunks:
@@ -43,25 +52,32 @@ def create_embeddings(chunks):
 
     return embeddings
 
-text = load_knowledge()
 
-chunks = chunk_knowledge(text)
+def ingest_knowledge():
+    require_database_config()
+    client = get_client()
+    text = load_knowledge()
+    chunks = chunk_knowledge(text)
+    embeddings = create_embeddings(chunks, client=client)
 
-embeddings = create_embeddings(chunks)
+    db = SessionLocal()
 
-db = SessionLocal()
+    try:
+        db.query(CompanyKnowledge).delete()
 
-db.query(CompanyKnowledge).delete()
+        for chunk, embedding in zip(chunks, embeddings):
+            policy_name = chunk.splitlines()[0].strip()
+            knowledge = CompanyKnowledge(
+                policy_name=policy_name,
+                content=chunk,
+                embedding=embedding
+            )
+            db.add(knowledge)
 
-for chunk, embedding in zip(chunks, embeddings):
-    policy_name = chunk.splitlines()[0].strip()  # Extract the first line as the policy name
-    knowledge = CompanyKnowledge(
-        policy_name = policy_name,
-        content = chunk,
-        embedding = embedding
-    )
+        db.commit()
+    finally:
+        db.close()
 
-    db.add(knowledge)
 
-db.commit()
-db.close()
+if __name__ == "__main__":
+    ingest_knowledge()

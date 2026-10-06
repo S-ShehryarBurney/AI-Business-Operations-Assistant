@@ -3,11 +3,12 @@ import os
 from openai import OpenAI
 import json
 from fastapi import FastAPI, Depends
-from app.database import SessionLocal
+from sqlalchemy.exc import SQLAlchemyError
+from app.database import get_session, require_database_config
 from app.models import Customer, Order, Product
 from app.rag import search_knowledge, list_company_policies
-from pydantic import BaseModel
-from app.errors import AgentLoopError, ToolError
+from pydantic import BaseModel, field_validator
+from app.errors import AgentLoopError, ToolError, ToolExecutionError
 
 load_dotenv()
 
@@ -16,8 +17,16 @@ app = FastAPI()
 class AssistantRequest(BaseModel):
     message: str
 
+    @field_validator("message")
+    @classmethod
+    def message_must_not_be_blank(cls, message):
+        if not message.strip():
+            raise ValueError("Message must contain at least one non-whitespace character.")
+        return message
+
 def get_db():
-    db = SessionLocal()
+    require_database_config()
+    db = get_session()
     try:
         yield db
     finally:
@@ -73,18 +82,22 @@ def assistant(request: AssistantRequest):
 
     except AgentLoopError as error:
         return {"answer": str(error)}
+    except Exception:
+        return {"answer": "The assistant could not complete the request at the moment."}
 
 openrouter_api_key = os.environ.get("OPENROUTER_API_KEY")
-
-if openrouter_api_key:
-    print("OpenRouter API Key Loaded")
-else:
-    raise ValueError("OpenRouter API Key Not Found")
 
 client = OpenAI(
     api_key=openrouter_api_key,
     base_url="https://openrouter.ai/api/v1"
-)
+) if openrouter_api_key else None
+
+
+def require_client():
+    if client is None:
+        raise ToolExecutionError(
+            "OpenRouter API key not configured. Set OPENROUTER_API_KEY before using the agent."
+        )
 
 def get_customer(customer_id):
 
@@ -94,7 +107,8 @@ def get_customer(customer_id):
     if customer_id <= 0:
         raise ToolError("Invalid customer ID. ID must be a positive integer.")
 
-    db = SessionLocal()
+    require_database_config()
+    db = get_session()
 
     try:
         customer = db.query(Customer).filter(Customer.customer_id == customer_id).first()
@@ -108,6 +122,10 @@ def get_customer(customer_id):
             "email": customer.email,
             "status": customer.status
         }
+    except SQLAlchemyError as exc:
+        raise ToolExecutionError(
+            "Customer lookup failed. Please try again later."
+        ) from exc
     finally:
         db.close()
 
@@ -119,7 +137,8 @@ def get_order(order_id):
     if order_id <= 0:
         raise ToolError("Invalid order ID. ID must be a positive integer.")
 
-    db = SessionLocal()
+    require_database_config()
+    db = get_session()
 
     try:
         order = db.query(Order).filter(Order.order_id == order_id).first()
@@ -133,6 +152,10 @@ def get_order(order_id):
             "product_id": order.product_id,
             "status": order.status
         }
+    except SQLAlchemyError as exc:
+        raise ToolExecutionError(
+            "Order lookup failed. Please try again later."
+        ) from exc
     finally:
         db.close()
 
@@ -143,7 +166,8 @@ def get_product(product_id):
     if product_id <= 0:
         raise ToolError("Invalid product ID. ID must be a positive integer.")
 
-    db = SessionLocal()
+    require_database_config()
+    db = get_session()
 
     try:
         product = db.query(Product).filter(Product.product_id == product_id).first()
@@ -157,6 +181,10 @@ def get_product(product_id):
             "price": product.price,
             "status": product.status
         }
+    except SQLAlchemyError as exc:
+        raise ToolExecutionError(
+            "Product lookup failed. Please try again later."
+        ) from exc
     finally:
         db.close()
 
@@ -248,14 +276,18 @@ Before answering:
 - Use company knowledge when the request involves company policies, procedures, rules, or internal information.
 - Cross-reference business data and company knowledge when the user's question requires both.
 - Do not guess or invent information.
-- Use tool results as evidence for your answer.
+- Treat tool errors as evidence that the fact was not successfully retrieved; do not treat an error as a valid answer.
+- If a business record does not exist or a tool returns an error, say the information is unavailable instead of inventing it.
+- If no relevant policy knowledge is found, say the policy information is unavailable instead of fabricating details.
+- Use list_company_policies when the user asks to list, name, or identify all policies in the internal knowledge base. Use search_knowledge when the user asks about the content or details of a policy.
+- Use only tool results as evidence for your final answer. Do not rely on assumptions or memory when a fact is missing.
 - Continue using tools until you have enough information to answer the user's complete request.
 - Once you have sufficient information, stop using tools and provide a concise, clear answer.
-- Use list_company_policies when the user asks to list, name, or identify all policies in the internal knowledge base. Use search_knowledge when the user asks about the content or details of a policy.
 """
 
 def run_agent(user_message):
-    
+    require_client()
+
     conversation = [
         {
             "role": "user",
@@ -264,22 +296,26 @@ def run_agent(user_message):
     ]
     max_rounds = 5
 
-    response = client.responses.create(
-        model = "nvidia/nemotron-3.5-lightning:free",
-        instructions = agent_instructions,
-        input = conversation,
-        tools = [get_customer_tool, 
-                 get_order_tool, 
-                 get_product_tool, 
-                 get_search_knowledge_tool, 
-                 list_company_policies_tool]
-    )
+    try:
+        response = client.responses.create(
+            model = "nvidia/nemotron-3.5-lightning:free",
+            instructions = agent_instructions,
+            input = conversation,
+            tools = [get_customer_tool,
+                     get_order_tool,
+                     get_product_tool,
+                     get_search_knowledge_tool,
+                     list_company_policies_tool]
+        )
+    except Exception as exc:
+        raise ToolExecutionError("The assistant could not complete the request at the moment.") from exc
 
     for round_number in range(max_rounds):
         tool_outputs = []
         tool_called = False
+        output_items = getattr(response, "output", []) or []
 
-        for item in response.output:
+        for item in output_items:
 
             if item.type == "function_call":
                 tool_called = True
@@ -324,7 +360,20 @@ def run_agent(user_message):
                         raise ToolError(f"Unknown tool: {item.name}")
 
                 except ToolError as error:
-                    tool_output = {"error": str(error)}
+                    tool_output = {
+                        "error": str(error),
+                        "error_type": "tool_error"
+                    }
+                except ToolExecutionError as error:
+                    tool_output = {
+                        "error": str(error),
+                        "error_type": "tool_execution_error"
+                    }
+                except Exception:
+                    tool_output = {
+                        "error": "The tool could not complete the request. Please try again later.",
+                        "error_type": "tool_execution_error"
+                    }
 
                 tool_outputs.append({
                     "type": "function_call_output",
@@ -332,21 +381,24 @@ def run_agent(user_message):
                     "output": json.dumps(tool_output)
                 })
 
-        conversation.extend(response.output)
+        conversation.extend(output_items)
         conversation.extend(tool_outputs)
 
         if not tool_called:
-            return response.output_text
+            return getattr(response, "output_text", "")
 
-        response = client.responses.create(
-                model = "nvidia/nemotron-3.5-lightning:free",
-                instructions = agent_instructions,
-                input = conversation,
-                tools = [get_customer_tool, 
-                         get_order_tool, 
-                         get_product_tool, 
-                         get_search_knowledge_tool, 
-                         list_company_policies_tool]
-            )
+        try:
+            response = client.responses.create(
+                    model = "nvidia/nemotron-3.5-lightning:free",
+                    instructions = agent_instructions,
+                    input = conversation,
+                    tools = [get_customer_tool,
+                             get_order_tool,
+                             get_product_tool,
+                             get_search_knowledge_tool,
+                             list_company_policies_tool]
+                )
+        except Exception as exc:
+            raise ToolExecutionError("The assistant could not complete the request at the moment.") from exc
 
     raise AgentLoopError("The agent could not complete the task within the allowed reasoning limit.")

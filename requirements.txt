@@ -2,6 +2,7 @@ openai
 python-dotenv
 pytest
 psycopg2-binary
+pgvector
 sqlalchemy
 fastapi
 uvicorn
